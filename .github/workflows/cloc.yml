@@ -1,0 +1,214 @@
+name: CLOC Code Statistics
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  cloc:
+    name: Count Lines of Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Install cloc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloc
+
+      - name: Run cloc and generate reports
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Environment: $(uname -a)"
+
+          # Generate each report format separately to avoid parameter conflicts
+          echo "Generating CSV report..."
+          cloc --csv --out=./cloc-report.csv --exclude-dir=.git,node_modules,__pycache__,.pytest_cache,dist,build .
+
+          echo "Generating JSON report..."
+          cloc --json --out=./cloc-report.json --exclude-dir=.git,node_modules,__pycache__,.pytest_cache,dist,build .
+
+          echo "Generating Markdown report..."
+          cloc --md --out=./cloc-report.md --exclude-dir=.git,node_modules,__pycache__,.pytest_cache,dist,build .
+
+          # Verify generated files
+          echo "Generated files:"
+          ls -la ./cloc-*
+
+      - name: Upload cloc reports as artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloc-reports
+          path: |
+            ./cloc-report.csv
+            ./cloc-report.json
+            ./cloc-report.md
+
+      - name: Generate summary table for PR comment
+        if: github.event_name == 'pull_request'
+        id: summary
+        run: |
+          echo "===== PR Comment Generation Debug ===="
+          echo "Current directory: $(pwd)"
+          echo "Files:"
+          ls -la ./cloc-* 2>/dev/null || echo "cloc report files not found"
+
+          python3 <<'PYEOF'
+          import os
+          import csv
+          import io
+
+          print("Generating PR comment summary...")
+
+          def parse_cloc_csv(csv_path):
+              """Parse cloc CSV report and return sorted rows with totals."""
+              rows = []
+              with open(csv_path, 'r', encoding='utf-8') as f:
+                  reader = csv.reader(f)
+                  header = next(reader, None)
+                  if not header or len(header) < 6:
+                      return rows, 0
+                  for parts in reader:
+                      if len(parts) < 6:
+                          continue
+                      lang = parts[1].strip()
+                      if lang == 'SUM':
+                          continue
+                      try:
+                          files = int(parts[0])
+                          blank = int(parts[3])
+                          comment = int(parts[4])
+                          code = int(parts[5])
+                          rows.append((lang, files, blank, comment, code))
+                      except (ValueError, IndexError):
+                          continue
+              rows.sort(key=lambda x: x[4], reverse=True)
+              total_code = sum(r[4] for r in rows)
+              return rows, total_code
+
+          def format_number(n):
+              return f"{n:,}"
+
+          def build_table(rows, total_code, with_percent=True):
+              """Build a markdown table from parsed rows."""
+              header = "| Language | Files | Blank | Comment | Code"
+              separator = "|----------|-------|-------|---------|------"
+              if with_percent:
+                  header += " | % |"
+                  separator += "|---|"
+              else:
+                  header += " |"
+                  separator += "|"
+
+              lines = [header, separator]
+              total_files = total_blank = total_comment = 0
+
+              for lang, files, blank, comment, code in rows:
+                  total_files += files
+                  total_blank += blank
+                  total_comment += comment
+                  row = f"| {lang} | {format_number(files)} | {format_number(blank)} | {format_number(comment)} | {format_number(code)}"
+                  if with_percent:
+                      pct = (code / total_code * 100) if total_code > 0 else 0
+                      row += f" | {pct:.1f}% |"
+                  lines.append(row)
+
+              total_row = f"| **Total** | **{format_number(total_files)}** | **{format_number(total_blank)}** | **{format_number(total_comment)}** | **{format_number(total_code)}**"
+              if with_percent:
+                  total_row += " | **100.0%** |"
+              lines.append(total_row)
+              return "\n".join(lines)
+
+          # Primary source: CSV report
+          csv_file = './cloc-report.csv'
+          table_content = ""
+
+          if os.path.exists(csv_file):
+              print(f"Reading data from {csv_file}")
+              try:
+                  rows, total_code = parse_cloc_csv(csv_file)
+                  if rows:
+                      table_content = build_table(rows, total_code, with_percent=True)
+              except Exception as e:
+                  print(f"Error reading CSV file: {e}")
+
+          # Fallback: extract from Markdown report
+          md_file = './cloc-report.md'
+          if not table_content and os.path.exists(md_file):
+              print(f"Falling back to {md_file}")
+              try:
+                  with open(md_file, 'r', encoding='utf-8') as f:
+                      md_content = f.read()
+                  if "| Language |" in md_content:
+                      md_lines = md_content.split('\n')
+                      captured = []
+                      in_table = False
+                      for line in md_lines:
+                          if "| Language |" in line:
+                              in_table = True
+                              captured.append("| Language | Files | Blank | Comment | Code |")
+                              captured.append("|----------|-------|-------|---------|------|")
+                              continue
+                          if in_table and "|" in line:
+                              if "---" in line:
+                                  continue
+                              captured.append(line.strip() + " |" if not line.strip().endswith("|") else line.strip())
+                          elif in_table and not line.strip():
+                              break
+                      if len(captured) > 2:
+                          table_content = "\n".join(captured)
+              except Exception as e:
+                  print(f"Error reading Markdown file: {e}")
+
+          # Final fallback
+          if not table_content:
+              print("Using fallback table template")
+              table_content = "| Language | Files | Blank | Comment | Code |\n|----------|-------|-------|---------|------|\n| Report is being generated | - | - | - | - |\n| Check artifacts for the full report | - | - | - | - |"
+
+          # Write table to step output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"table<<EOF\n{table_content}\nEOF\n")
+
+          print("PR comment table generation complete")
+          print("\nTable preview:")
+          print(table_content[:500] + "..." if len(table_content) > 500 else table_content)
+          PYEOF
+
+      - name: Comment PR with cloc summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const table = `${{ steps.summary.outputs.table }}`;
+            const body = `## 📊 Lines of Code Report (cloc)\n\n${table}\n\n<details><summary>Full reports</summary>\n\nDownload artifacts from the [workflow run](../actions/runs/${{ github.run_id }}).\n\n</details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Generate job summary
+        run: |
+          echo "===== Job Summary Generation Debug ===="
+          echo "Current directory: $(pwd)"
+          echo "Files:"
+          ls -la ./cloc-* 2>/dev/null || echo "cloc report files not found"
+
+          python3 <<'PYEOF'
+          import os
+          import csv
